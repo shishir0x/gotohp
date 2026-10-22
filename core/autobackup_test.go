@@ -13,6 +13,7 @@ func TestAutoBackupHistory(t *testing.T) {
 	historyPath := filepath.Join(tempDir, "history.json")
 
 	h := NewAutoBackupHistory(historyPath)
+	defer func() { _ = h.Close() }()
 	if h.Count() != 0 {
 		t.Fatalf("expected count 0, got %d", h.Count())
 	}
@@ -47,8 +48,10 @@ func TestAutoBackupHistory(t *testing.T) {
 	if err := h.Save(); err != nil {
 		t.Fatalf("failed to save history: %v", err)
 	}
+	_ = h.Close()
 
 	h2 := NewAutoBackupHistory(historyPath)
+	defer func() { _ = h2.Close() }()
 	if !h2.IsUploaded(testFile, fi.Size(), fi.ModTime().Unix()) {
 		t.Fatal("expected file to be uploaded in reloaded history")
 	}
@@ -93,6 +96,10 @@ func TestAutoBackupManagerLifecycle(t *testing.T) {
 	if err := LoadConfig(cfgFile); err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		_ = CloseAppDatabase()
+		ConfigPath = ""
+	}()
 
 	mgr := &ConfigManager{}
 	updated, err := mgr.AddAutoBackupFolder(folder1)
@@ -220,6 +227,7 @@ func TestAutoBackupHistoryInvalidation(t *testing.T) {
 	historyPath := filepath.Join(tempDir, "history.json")
 
 	h := NewAutoBackupHistory(historyPath)
+	defer func() { _ = h.Close() }()
 	testPath := filepath.Join(tempDir, "photo.jpg")
 
 	h.MarkUploaded(testPath, 1024, 1700000000)

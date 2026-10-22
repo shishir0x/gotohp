@@ -54,6 +54,12 @@ func runGUI() {
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: false,
 		},
+		Windows: application.WindowsOptions{
+			DisableQuitOnLastWindowClosed: true,
+		},
+		Linux: application.LinuxOptions{
+			DisableQuitOnLastWindowClosed: true,
+		},
 	})
 
 	window := wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
@@ -184,7 +190,7 @@ func runGUI() {
 	})
 
 	// Intercept window close so it minimizes to system tray instead of exiting
-	window.OnWindowEvent(events.Common.WindowClosing, func(event *application.WindowEvent) {
+	window.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
 		if !isQuitting {
 			event.Cancel()
 			window.Hide()
@@ -193,6 +199,7 @@ func runGUI() {
 
 	err := wailsApp.Run()
 	autoBackupManager.Stop() // clean shutdown
+	_ = core.CloseAppDatabase()
 	if err != nil {
 		log.Fatal(err)
 	}

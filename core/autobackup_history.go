@@ -1,12 +1,12 @@
 package core
 
 import (
-	"encoding/json"
-	"os"
+	"database/sql"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 // BackupFileRecord stores file metadata at the time of a successful upload.
@@ -15,13 +15,12 @@ type BackupFileRecord struct {
 	ModTime int64 `json:"modTime"`
 }
 
-// AutoBackupHistory maintains a persistent record of uploaded files to prevent
-// duplicate uploads across application restarts.
+// AutoBackupHistory maintains an SQLite-backed persistent record of uploaded files
+// to prevent duplicate uploads across application restarts.
 type AutoBackupHistory struct {
-	mu       sync.RWMutex
-	filePath string
-	records  map[string]BackupFileRecord
-	dirty    bool
+	mu     sync.RWMutex
+	db     *sql.DB
+	ownsDB bool
 }
 
 func normalizeHistoryKey(path string) string {
@@ -45,79 +44,100 @@ func defaultHistoryFilePath() string {
 	return filepath.Join(cfgDir, "autobackup_history.json")
 }
 
-// NewAutoBackupHistory loads or initializes the auto-backup history.
-func NewAutoBackupHistory(filePath string) *AutoBackupHistory {
-	if filePath == "" {
-		filePath = defaultHistoryFilePath()
+// NewAutoBackupHistory initializes the SQLite history store and automatically
+// migrates any pre-existing JSON history.
+func NewAutoBackupHistory(dbOrFilePath string) *AutoBackupHistory {
+	var db *sql.DB
+	var err error
+	ownsDB := false
+
+	if dbOrFilePath == "" {
+		db, err = GetAppDatabase()
+		if err != nil {
+			// Fallback to in-memory if app db fails
+			db, _ = OpenDatabase(":memory:")
+			ownsDB = true
+		}
+	} else if dbOrFilePath == ":memory:" {
+		db, _ = OpenDatabase(":memory:")
+		ownsDB = true
+	} else {
+		ownsDB = true
+		// If path ends in .json or does not end in .db, treat as migration / custom path
+		if strings.HasSuffix(strings.ToLower(dbOrFilePath), ".json") {
+			dbPath := strings.TrimSuffix(dbOrFilePath, filepath.Ext(dbOrFilePath)) + ".db"
+			db, err = OpenDatabase(dbPath)
+			if err != nil {
+				db, _ = OpenDatabase(":memory:")
+			}
+			// Migrate the specific JSON file if present
+			_ = MigrateJSONHistory(db, dbOrFilePath)
+		} else {
+			db, err = OpenDatabase(dbOrFilePath)
+			if err != nil {
+				db, _ = OpenDatabase(":memory:")
+			}
+		}
 	}
+
 	h := &AutoBackupHistory{
-		filePath: filePath,
-		records:  make(map[string]BackupFileRecord),
+		db:     db,
+		ownsDB: ownsDB,
 	}
-	h.Load()
+
+	// Default automatic migration of legacy autobackup_history.json
+	if dbOrFilePath == "" {
+		_ = MigrateJSONHistory(db, defaultHistoryFilePath())
+	}
+
 	return h
 }
 
-// Load reads the history file from disk.
-func (h *AutoBackupHistory) Load() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	data, err := os.ReadFile(h.filePath)
-	if err != nil {
-		return
-	}
-	var loaded map[string]BackupFileRecord
-	if err := json.Unmarshal(data, &loaded); err == nil && loaded != nil {
-		h.records = loaded
-	}
+// NewAutoBackupHistoryWithDB creates an AutoBackupHistory instance using an existing db handle.
+func NewAutoBackupHistoryWithDB(db *sql.DB) *AutoBackupHistory {
+	return &AutoBackupHistory{db: db, ownsDB: false}
 }
 
-// Save writes the records to disk if changes were made.
-func (h *AutoBackupHistory) Save() error {
+// Close closes the underlying database if owned by this instance.
+func (h *AutoBackupHistory) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if !h.dirty {
-		return nil
-	}
-
-	data, err := json.MarshalIndent(h.records, "", "  ")
-	if err != nil {
+	if h.ownsDB && h.db != nil {
+		err := h.db.Close()
+		h.db = nil
 		return err
 	}
+	return nil
+}
 
-	dir := filepath.Dir(h.filePath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
+// Load is a no-op kept for backward compatibility with existing callers.
+func (h *AutoBackupHistory) Load() {}
 
-	tmpFile := h.filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0o644); err != nil {
-		return err
-	}
-
-	_ = os.Remove(h.filePath) // Windows overwrite safety
-	if err := os.Rename(tmpFile, h.filePath); err != nil {
-		return os.WriteFile(h.filePath, data, 0o644)
-	}
-
-	h.dirty = false
+// Save is a no-op kept for backward compatibility since writes are committed immediately.
+func (h *AutoBackupHistory) Save() error {
 	return nil
 }
 
 // IsUploaded reports whether a file with identical size and modification time
-// has already been recorded as uploaded.
+// has already been recorded in SQLite.
 func (h *AutoBackupHistory) IsUploaded(path string, size int64, modTime int64) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	key := normalizeHistoryKey(path)
-	rec, ok := h.records[key]
-	if !ok {
+	if h.db == nil {
 		return false
 	}
-	return rec.Size == size && rec.ModTime == modTime
+
+	key := normalizeHistoryKey(path)
+	var dummy int
+	err := h.db.QueryRow(`
+		SELECT 1 FROM backup_history
+		WHERE path = ? AND size = ? AND mod_time = ?
+		LIMIT 1;
+	`, key, size, modTime).Scan(&dummy)
+
+	return err == nil
 }
 
 // MarkUploaded records that the file was successfully uploaded or confirmed remote.
@@ -125,12 +145,21 @@ func (h *AutoBackupHistory) MarkUploaded(path string, size int64, modTime int64)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	key := normalizeHistoryKey(path)
-	h.records[key] = BackupFileRecord{
-		Size:    size,
-		ModTime: modTime,
+	if h.db == nil {
+		return
 	}
-	h.dirty = true
+
+	key := normalizeHistoryKey(path)
+	now := time.Now().Unix()
+
+	_, _ = h.db.Exec(`
+		INSERT INTO backup_history (path, size, mod_time, uploaded_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			size = excluded.size,
+			mod_time = excluded.mod_time,
+			uploaded_at = excluded.uploaded_at;
+	`, key, size, modTime, now)
 }
 
 // Invalidate removes a file record from history so it will be reconsidered on next scan.
@@ -138,16 +167,27 @@ func (h *AutoBackupHistory) Invalidate(path string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	key := normalizeHistoryKey(path)
-	if _, ok := h.records[key]; ok {
-		delete(h.records, key)
-		h.dirty = true
+	if h.db == nil {
+		return
 	}
+
+	key := normalizeHistoryKey(path)
+	_, _ = h.db.Exec(`DELETE FROM backup_history WHERE path = ?;`, key)
 }
 
-// Count returns the number of recorded uploaded files.
+// Count returns the number of recorded uploaded files in SQLite.
 func (h *AutoBackupHistory) Count() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return len(h.records)
+
+	if h.db == nil {
+		return 0
+	}
+
+	var count int
+	err := h.db.QueryRow(`SELECT COUNT(*) FROM backup_history;`).Scan(&count)
+	if err != nil {
+		return 0
+	}
+	return count
 }
