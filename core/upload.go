@@ -496,6 +496,9 @@ func filterGooglePhotosFilesWithCancel(paths []string, opts UploadOptions, cance
 		}
 		fileInfo, err := os.Stat(path)
 		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
 			return nil, fmt.Errorf("error accessing path %s: %w", path, err)
 		}
 
@@ -730,6 +733,13 @@ func (m *UploadManager) runWorker(workerID int, workChan <-chan UploadWorkItem, 
 			paths := uploadWorkPaths(item)
 			isLivePhoto := item.Kind == UploadWorkLivePhoto
 			mediaKey, skipped, err := uploadWorkItem(ctx, api, item, opts, workerID, m.reporter)
+			if opts.OnFileUploaded != nil && (err == nil || mediaKey != "" || skipped) {
+				for _, p := range paths {
+					if info, statErr := os.Stat(p); statErr == nil {
+						opts.OnFileUploaded(p, info.Size(), info.ModTime().Unix())
+					}
+				}
+			}
 			if err != nil && mediaKey != "" {
 				results <- FileUploadResult{IsLivePhoto: isLivePhoto, Path: path, Paths: paths, MediaKey: mediaKey}
 				m.reporter.Warning(PreflightWarning{
