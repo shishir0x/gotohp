@@ -41,6 +41,7 @@ func main() {
 func runGUI() {
 	normalizeFrontendDevServerURL()
 
+	var mainWindow *application.WebviewWindow
 	configManager := &core.ConfigManager{}
 	wailsApp := application.New(application.Options{
 		Name:        "com.xob0t.gotohp",
@@ -60,6 +61,15 @@ func runGUI() {
 		Linux: application.LinuxOptions{
 			DisableQuitOnLastWindowClosed: true,
 		},
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: "com.xob0t.gotohp",
+			OnSecondInstanceLaunch: func(data application.SecondInstanceData) {
+				if mainWindow != nil {
+					mainWindow.Show()
+					mainWindow.Focus()
+				}
+			},
+		},
 	})
 
 	window := wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
@@ -78,6 +88,7 @@ func runGUI() {
 		},
 		URL: "/",
 	})
+	mainWindow = window
 
 	uploadManager := core.NewUploadManager(gui.NewWailsReporter(wailsApp), wailsApp.Logger)
 

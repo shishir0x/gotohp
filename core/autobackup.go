@@ -1,20 +1,31 @@
 package core
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
 const (
-	autoBackupDebounce = 2 * time.Second
+	autoBackupDebounce = 5 * time.Second
 	maxWatchedDirs     = 500
 )
+
+type backupFailureInfo struct {
+	consecutiveFailures int
+	nextRetry           time.Time
+	lastErr             string
+	lastSize            int64
+	lastModTime         int64
+}
 
 // AutoBackupManager watches configured folders and triggers automatic uploads
 // of newly added or changed media files.
@@ -31,6 +42,7 @@ type AutoBackupManager struct {
 	stopped  bool
 	pending  map[string]struct{}
 	debounce *time.Timer
+	failures map[string]*backupFailureInfo
 }
 
 // NewAutoBackupManager creates a manager with persistent upload tracking.
@@ -43,8 +55,30 @@ func NewAutoBackupManager(uploadManager *UploadManager, logger *slog.Logger, onS
 		logger:         logger,
 		history:        NewAutoBackupHistory(""),
 		pending:        make(map[string]struct{}),
+		failures:       make(map[string]*backupFailureInfo),
 		onStatusChange: onStatusChange,
 	}
+}
+
+func cleanMonitoredFolders(folders []string) []string {
+	var cleaned []string
+	for _, f := range folders {
+		abs, err := filepath.Abs(filepath.Clean(f))
+		if err != nil {
+			abs = filepath.Clean(f)
+		}
+		isSub := false
+		for _, existing := range cleaned {
+			if areSameFolderPath(existing, abs) || isSubFolderPath(existing, abs) {
+				isSub = true
+				break
+			}
+		}
+		if !isSub {
+			cleaned = append(cleaned, abs)
+		}
+	}
+	return cleaned
 }
 
 // Start begins watching the currently configured backup folders and triggers
@@ -58,7 +92,7 @@ func (m *AutoBackupManager) Start() error {
 	}
 
 	cfg := currentConfig().AutoBackup
-	folders := cfg.Folders
+	folders := cleanMonitoredFolders(cfg.Folders)
 	if len(folders) == 0 {
 		m.logger.Info("auto-backup: no folders configured, watcher not started")
 		return nil
@@ -160,10 +194,12 @@ func (m *AutoBackupManager) Restart() error {
 	return m.Start()
 }
 
-// TriggerScan manually schedules an immediate scan of all configured backup folders.
+// TriggerScan manually schedules an immediate scan of all configured backup folders
+// and resets backoff counters to allow immediate re-evaluation.
 func (m *AutoBackupManager) TriggerScan() {
 	m.mu.Lock()
-	folders := currentConfig().AutoBackup.Folders
+	m.failures = make(map[string]*backupFailureInfo)
+	folders := cleanMonitoredFolders(currentConfig().AutoBackup.Folders)
 	stopped := m.stopped || m.watcher == nil
 	m.mu.Unlock()
 
@@ -172,18 +208,105 @@ func (m *AutoBackupManager) TriggerScan() {
 	}
 }
 
+func (m *AutoBackupManager) recordFailure(path string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	abs, aErr := filepath.Abs(path)
+	if aErr != nil {
+		abs = path
+	}
+
+	info, _ := os.Stat(abs)
+	var size, mtime int64
+	if info != nil {
+		size = info.Size()
+		mtime = info.ModTime().Unix()
+	}
+
+	rec, exists := m.failures[abs]
+	if !exists {
+		rec = &backupFailureInfo{
+			lastSize:    size,
+			lastModTime: mtime,
+		}
+		m.failures[abs] = rec
+	}
+	rec.consecutiveFailures++
+	rec.lastErr = err.Error()
+
+	// Bounded exponential backoff: 2m, 8m, 32m, 2h, max 4h
+	shift := min(rec.consecutiveFailures-1, 6)
+	backoff := time.Duration(1<<shift) * 2 * time.Minute
+	if backoff > 4*time.Hour {
+		backoff = 4 * time.Hour
+	}
+	rec.nextRetry = time.Now().Add(backoff)
+	m.logger.Warn("auto-backup: file upload failed; backing off",
+		"path", abs,
+		"attempts", rec.consecutiveFailures,
+		"retryAfter", rec.nextRetry,
+		"err", err)
+}
+
+func (m *AutoBackupManager) clearFailure(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	delete(m.failures, abs)
+}
+
+func (m *AutoBackupManager) shouldSkipFailure(path string, size int64, modTime int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	rec, exists := m.failures[abs]
+	if !exists {
+		return false
+	}
+
+	// If file was modified or resized since the failure, reset failure and allow retry
+	if rec.lastSize != size || rec.lastModTime != modTime {
+		delete(m.failures, abs)
+		return false
+	}
+
+	// If backoff window has not elapsed, skip it
+	return time.Now().Before(rec.nextRetry)
+}
+
 // addWatchRecursive walks a folder tree and registers directories with the watcher
 // up to maxWatchedDirs to prevent exhausting operating-system watcher handles.
 func (m *AutoBackupManager) addWatchRecursive(w *fsnotify.Watcher, root string) error {
+	fi, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("not a directory: %s", root)
+	}
 	if w == nil {
 		return nil
 	}
+
+	excludePattern := currentConfig().Preferences.UploadOptions().ExcludePattern
 	count := 0
 	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
+			if excludePattern != "" && d.Name() == excludePattern {
+				return filepath.SkipDir
+			}
 			if count >= maxWatchedDirs {
 				m.logger.Warn("auto-backup: reached maximum watched directories limit; subdirectories will be backed up via periodic scan",
 					"root", root, "limit", maxWatchedDirs)
@@ -202,6 +325,7 @@ func (m *AutoBackupManager) addWatchRecursive(w *fsnotify.Watcher, root string) 
 // scanFolders recursively scans the given folders for existing files that haven't
 // been uploaded yet and schedules them for backup.
 func (m *AutoBackupManager) scanFolders(folders []string) {
+	folders = cleanMonitoredFolders(folders)
 	m.logger.Info("auto-backup: scanning folders", "folders", folders)
 	queued := 0
 
@@ -221,6 +345,9 @@ func (m *AutoBackupManager) scanFolders(folders []string) {
 			}
 
 			if d.IsDir() {
+				if opts.ExcludePattern != "" && d.Name() == opts.ExcludePattern {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 
@@ -239,6 +366,11 @@ func (m *AutoBackupManager) scanFolders(folders []string) {
 
 			// If already uploaded and unmodified, skip it
 			if m.history.IsUploaded(path, info.Size(), info.ModTime().Unix()) {
+				return nil
+			}
+
+			// If file previously failed and is still within backoff window, skip it
+			if m.shouldSkipFailure(path, info.Size(), info.ModTime().Unix()) {
 				return nil
 			}
 
@@ -270,8 +402,13 @@ func (m *AutoBackupManager) loop() {
 
 		case <-ticker.C:
 			// Periodic recurring scan
-			folders := currentConfig().AutoBackup.Folders
+			cfg := currentConfig().AutoBackup
+			folders := cleanMonitoredFolders(cfg.Folders)
 			if len(folders) > 0 {
+				// Try re-adding any folders that were previously disconnected/unavailable
+				for _, folder := range folders {
+					_ = m.addWatchRecursive(w, folder)
+				}
 				go m.scanFolders(folders)
 			}
 
@@ -280,8 +417,8 @@ func (m *AutoBackupManager) loop() {
 				return
 			}
 
-			// If a new directory was created, watch it and scan it
-			if event.Has(fsnotify.Create) {
+			// If a new directory was created or renamed into the tree, watch it and scan it
+			if event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
 				if fi, err := os.Stat(event.Name); err == nil && fi.IsDir() {
 					_ = m.addWatchRecursive(w, event.Name)
 					go m.scanFolders([]string{event.Name})
@@ -289,13 +426,7 @@ func (m *AutoBackupManager) loop() {
 				}
 			}
 
-			// If a file was modified or written to, invalidate its history entry so
-			// it will be reconsidered even if metadata changes are subtle.
-			if event.Has(fsnotify.Write) {
-				m.history.Invalidate(event.Name)
-			}
-
-			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) {
+			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) || event.Has(fsnotify.Rename) {
 				m.schedule(event.Name)
 			}
 
@@ -337,6 +468,51 @@ func isTemporaryDownloadFile(filename string) bool {
 	case ".crdownload", ".part", ".download", ".tmp", ".temp", ".aria2", ".partial":
 		return true
 	}
+	return false
+}
+
+// isFileReadyForUpload verifies that a file is not in the middle of being copied,
+// written, or downloaded by another process.
+func isFileReadyForUpload(path string, info os.FileInfo) bool {
+	if isTemporaryDownloadFile(path) {
+		return false
+	}
+	if info == nil {
+		var err error
+		info, err = os.Stat(path)
+		if err != nil || info.IsDir() || info.Size() == 0 {
+			return false
+		}
+	}
+
+	// If file was modified within the last second, give it time to settle
+	if time.Since(info.ModTime()) < 1*time.Second {
+		return false
+	}
+
+	// Attempt to open read-write to verify no exclusive write lock is held by copier/downloader
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err == nil {
+		_ = f.Close()
+		return true
+	}
+
+	// On Windows, error 32 is ERROR_SHARING_VIOLATION and 33 is ERROR_LOCK_VIOLATION
+	var errno syscall.Errno
+	if errors.As(err, &errno) && (errno == 32 || errno == 33) {
+		return false // Actively locked by writer/copier
+	}
+
+	// If file is marked read-only on disk, O_RDWR will return os.ErrPermission;
+	// test read-only open to confirm readability.
+	if errors.Is(err, os.ErrPermission) {
+		ro, roErr := os.Open(path)
+		if roErr == nil {
+			_ = ro.Close()
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -383,8 +559,15 @@ func (m *AutoBackupManager) flush() {
 
 	opts := currentConfig().Preferences.UploadOptions()
 	opts.Recursive = true
+	// CRITICAL FIX: Auto Backup must never delete local files from monitored directories!
+	opts.DeleteFromHost = false
+
 	opts.OnFileUploaded = func(path string, size int64, modTime int64) {
-		m.history.MarkUploaded(path, size, modTime)
+		_ = m.history.MarkUploaded(path, size, modTime)
+		m.clearFailure(path)
+	}
+	opts.OnFileFailed = func(path string, err error) {
+		m.recordFailure(path, err)
 	}
 
 	var readyPaths []string
@@ -418,18 +601,21 @@ func (m *AutoBackupManager) flush() {
 			continue
 		}
 
-		// Check if file is currently locked by a downloader or writer
-		f, err := os.Open(p)
-		if err != nil {
+		// Skip if file previously failed and is still within backoff window
+		if m.shouldSkipFailure(p, info.Size(), info.ModTime().Unix()) {
+			continue
+		}
+
+		// Check if file is ready and not locked by an active writer/copier
+		if !isFileReadyForUpload(p, info) {
 			retryPaths = append(retryPaths, p)
 			continue
 		}
-		_ = f.Close()
 
 		readyPaths = append(readyPaths, p)
 	}
 
-	// Re-queue any files that were locked
+	// Re-queue any files that were not ready yet
 	if len(retryPaths) > 0 {
 		m.mu.Lock()
 		for _, rp := range retryPaths {
@@ -442,16 +628,21 @@ func (m *AutoBackupManager) flush() {
 	}
 
 	if len(readyPaths) == 0 {
-		_ = m.history.Save()
 		return
 	}
 
 	m.logger.Info("auto-backup: triggering upload", "files", len(readyPaths))
-	m.uploadManager.Upload(readyPaths, opts)
-
-	// Persist history after starting upload
-	go func() {
-		time.Sleep(3 * time.Second)
-		_ = m.history.Save()
-	}()
+	if !m.uploadManager.Upload(readyPaths, opts) {
+		// Upload manager was busy, re-queue readyPaths and retry after delay
+		m.logger.Info("auto-backup: upload manager busy, re-queueing ready files", "files", len(readyPaths))
+		m.mu.Lock()
+		for _, rp := range readyPaths {
+			m.pending[rp] = struct{}{}
+		}
+		if m.debounce == nil && !m.stopped {
+			m.debounce = time.AfterFunc(3*time.Second, m.flush)
+		}
+		m.mu.Unlock()
+		return
+	}
 }

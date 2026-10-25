@@ -119,14 +119,15 @@ type ThreadStatus struct {
 	Attempt       int    `json:"Attempt"` // Current attempt number (1-based), 0 if not applicable
 }
 
-// Upload starts an upload run in the background. Progress is delivered through
-// the manager's UploadReporter; UploadStop marks the end of the run.
-func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
+// Upload starts an upload run in the background. It returns true if the run
+// was started, or false if an upload run is already in progress. Progress is
+// delivered through the manager's UploadReporter; UploadStop marks the end of the run.
+func (m *UploadManager) Upload(paths []string, opts UploadOptions) bool {
 	opts = opts.normalized()
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
-		return
+		return false
 	}
 	m.running = true
 	m.cancel = make(chan struct{})
@@ -142,7 +143,7 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			m.finish()
-			return
+			return true
 		}
 		m.reporter.FileResult(FileUploadResult{
 			IsError:      true,
@@ -150,7 +151,7 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
 			ErrorMessage: err.Error(),
 		})
 		m.finish()
-		return
+		return true
 	}
 	workItems, preflightWarnings := ClassifyUploadWork(targetPaths, LivePhotoClassificationOptions{
 		Enabled:             opts.PairLivePhotos,
@@ -160,18 +161,23 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
 	}, nil)
 	if m.isCancelled() {
 		m.finish()
-		return
+		return true
 	}
 	m.reportPreflight(len(workItems), preflightWarnings)
 
 	if len(workItems) == 0 {
 		m.finish()
-		return
+		return true
 	}
 
 	if _, err := NewApi(opts.Api); err != nil {
 		for _, item := range workItems {
 			path := uploadWorkPrimaryPath(item)
+			if opts.OnFileFailed != nil {
+				for _, p := range uploadWorkPaths(item) {
+					opts.OnFileFailed(p, err)
+				}
+			}
 			m.reporter.FileResult(FileUploadResult{
 				IsError:      true,
 				Error:        err,
@@ -180,7 +186,7 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
 			})
 		}
 		m.finish()
-		return
+		return true
 	}
 
 	// Calculate total bytes asynchronously and emit update when complete
@@ -255,6 +261,7 @@ func (m *UploadManager) Upload(paths []string, opts UploadOptions) {
 
 		m.finish()
 	}()
+	return true
 }
 
 // finish signals the end of a run and releases the manager for the next one.
@@ -745,6 +752,10 @@ func (m *UploadManager) runWorker(workerID int, workChan <-chan UploadWorkItem, 
 					if info, statErr := os.Stat(p); statErr == nil {
 						opts.OnFileUploaded(p, info.Size(), info.ModTime().Unix())
 					}
+				}
+			} else if opts.OnFileFailed != nil && err != nil {
+				for _, p := range paths {
+					opts.OnFileFailed(p, err)
 				}
 			}
 			if err != nil && mediaKey != "" {

@@ -2,6 +2,7 @@ package core
 
 import (
 	"database/sql"
+	"log/slog"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -141,18 +142,18 @@ func (h *AutoBackupHistory) IsUploaded(path string, size int64, modTime int64) b
 }
 
 // MarkUploaded records that the file was successfully uploaded or confirmed remote.
-func (h *AutoBackupHistory) MarkUploaded(path string, size int64, modTime int64) {
+func (h *AutoBackupHistory) MarkUploaded(path string, size int64, modTime int64) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if h.db == nil {
-		return
+		return nil
 	}
 
 	key := normalizeHistoryKey(path)
 	now := time.Now().Unix()
 
-	_, _ = h.db.Exec(`
+	_, err := h.db.Exec(`
 		INSERT INTO backup_history (path, size, mod_time, uploaded_at)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
@@ -160,19 +161,27 @@ func (h *AutoBackupHistory) MarkUploaded(path string, size int64, modTime int64)
 			mod_time = excluded.mod_time,
 			uploaded_at = excluded.uploaded_at;
 	`, key, size, modTime, now)
+	if err != nil {
+		slog.Default().Error("auto-backup: failed to record file in history database", "path", path, "err", err)
+	}
+	return err
 }
 
 // Invalidate removes a file record from history so it will be reconsidered on next scan.
-func (h *AutoBackupHistory) Invalidate(path string) {
+func (h *AutoBackupHistory) Invalidate(path string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if h.db == nil {
-		return
+		return nil
 	}
 
 	key := normalizeHistoryKey(path)
-	_, _ = h.db.Exec(`DELETE FROM backup_history WHERE path = ?;`, key)
+	_, err := h.db.Exec(`DELETE FROM backup_history WHERE path = ?;`, key)
+	if err != nil {
+		slog.Default().Error("auto-backup: failed to delete file from history database", "path", path, "err", err)
+	}
+	return err
 }
 
 // Count returns the number of recorded uploaded files in SQLite.

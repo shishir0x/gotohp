@@ -307,26 +307,58 @@ func areSameFolderPath(p1, p2 string) bool {
 	return c1 == c2
 }
 
+func isSubFolderPath(parent, child string) bool {
+	p := filepath.Clean(parent)
+	c := filepath.Clean(child)
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(p)
+		c = strings.ToLower(c)
+	}
+	rel, err := filepath.Rel(p, c)
+	if err != nil {
+		return false
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return false
+	}
+	return true
+}
+
 // AddAutoBackupFolder adds path to the backup folders list if it is not already
-// present. Returns the updated folder list.
+// present or covered by an existing parent folder. Returns the updated folder list.
 func (g *ConfigManager) AddAutoBackupFolder(path string) ([]string, error) {
 	ensureConfigLoaded()
-	path = filepath.Clean(path)
-	if _, err := os.Stat(path); err != nil {
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		absPath = filepath.Clean(path)
+	}
+	if _, err := os.Stat(absPath); err != nil {
 		return nil, fmt.Errorf("folder does not exist or is inaccessible: %w", err)
 	}
 
 	configMu.Lock()
 	defer configMu.Unlock()
 
+	var updated []string
 	for _, existing := range AppConfig.AutoBackup.Folders {
-		if areSameFolderPath(existing, path) {
+		if areSameFolderPath(existing, absPath) {
 			result := make([]string, len(AppConfig.AutoBackup.Folders))
 			copy(result, AppConfig.AutoBackup.Folders)
 			return result, nil // already in list
 		}
+		// If the new path is a subfolder of an existing monitored folder, do not add duplicate child
+		if isSubFolderPath(existing, absPath) {
+			result := make([]string, len(AppConfig.AutoBackup.Folders))
+			copy(result, AppConfig.AutoBackup.Folders)
+			return result, nil
+		}
+		// If the new path is a parent of an existing monitored folder, replace child with parent
+		if !isSubFolderPath(absPath, existing) {
+			updated = append(updated, existing)
+		}
 	}
-	AppConfig.AutoBackup.Folders = append(AppConfig.AutoBackup.Folders, path)
+	updated = append(updated, absPath)
+	AppConfig.AutoBackup.Folders = updated
 	_ = saveAppConfigLocked()
 	result := make([]string, len(AppConfig.AutoBackup.Folders))
 	copy(result, AppConfig.AutoBackup.Folders)
@@ -337,11 +369,14 @@ func (g *ConfigManager) AddAutoBackupFolder(path string) ([]string, error) {
 // Returns the updated folder list.
 func (g *ConfigManager) RemoveAutoBackupFolder(path string) []string {
 	ensureConfigLoaded()
-	path = filepath.Clean(path)
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		absPath = filepath.Clean(path)
+	}
 	updateAppConfig(func(config *Config) {
 		var updated []string
 		for _, f := range config.AutoBackup.Folders {
-			if !areSameFolderPath(f, path) {
+			if !areSameFolderPath(f, absPath) && !areSameFolderPath(f, path) {
 				updated = append(updated, f)
 			}
 		}

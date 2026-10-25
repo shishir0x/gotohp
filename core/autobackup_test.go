@@ -1,11 +1,13 @@
 package core
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAutoBackupHistory(t *testing.T) {
@@ -259,3 +261,159 @@ func TestAddWatchRecursiveLimit(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestNestedFolderDeduplication(t *testing.T) {
+	tempDir := t.TempDir()
+	parentDir := filepath.Join(tempDir, "Photos")
+	childDir := filepath.Join(parentDir, "Vacation")
+	if err := os.MkdirAll(childDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgFile := filepath.Join(tempDir, "gotohp.config")
+	if err := LoadConfig(cfgFile); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = CloseAppDatabase()
+		ConfigPath = ""
+	}()
+
+	mgr := &ConfigManager{}
+	// Add parent folder
+	list, err := mgr.AddAutoBackupFolder(parentDir)
+	if err != nil {
+		t.Fatalf("failed to add parent folder: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 folder, got %d", len(list))
+	}
+
+	// Try adding child folder - should be subsumed by parent and not added
+	list2, err := mgr.AddAutoBackupFolder(childDir)
+	if err != nil {
+		t.Fatalf("unexpected error adding child folder: %v", err)
+	}
+	if len(list2) != 1 {
+		t.Fatalf("expected child folder to be subsumed by parent, got list: %v", list2)
+	}
+
+	// Now remove parent folder and add child first
+	mgr.RemoveAutoBackupFolder(parentDir)
+	list3, err := mgr.AddAutoBackupFolder(childDir)
+	if err != nil {
+		t.Fatalf("failed to add child: %v", err)
+	}
+	if len(list3) != 1 {
+		t.Fatalf("expected 1 folder, got %d", len(list3))
+	}
+
+	// Adding parent now should replace child folder with parent
+	list4, err := mgr.AddAutoBackupFolder(parentDir)
+	if err != nil {
+		t.Fatalf("unexpected error adding parent: %v", err)
+	}
+	if len(list4) != 1 || list4[0] != parentDir {
+		t.Fatalf("expected parent to replace child folder, got: %v", list4)
+	}
+
+	// Test cleanMonitoredFolders helper
+	rawList := []string{parentDir, childDir, parentDir}
+	cleaned := cleanMonitoredFolders(rawList)
+	if len(cleaned) != 1 || cleaned[0] != parentDir {
+		t.Fatalf("expected cleanMonitoredFolders to prune child and duplicate, got: %v", cleaned)
+	}
+}
+
+func TestAddWatchNonExistentFolder(t *testing.T) {
+	tempDir := t.TempDir()
+	abManager := NewAutoBackupManager(nil, slog.Default(), nil)
+	nonExistent := filepath.Join(tempDir, "does_not_exist")
+
+	err := abManager.addWatchRecursive(nil, nonExistent)
+	if err == nil {
+		t.Fatal("expected error when adding non-existent folder, got nil")
+	}
+}
+
+func TestFileReadinessCheck(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Temporary download file should not be ready
+	tempFile := filepath.Join(tempDir, "image.jpg.crdownload")
+	_ = os.WriteFile(tempFile, []byte("downloading"), 0o644)
+	if isFileReadyForUpload(tempFile, nil) {
+		t.Fatal("expected temporary download file to not be ready")
+	}
+
+	// 2. 0-byte file should not be ready
+	zeroFile := filepath.Join(tempDir, "empty.jpg")
+	_ = os.WriteFile(zeroFile, []byte(""), 0o644)
+	if isFileReadyForUpload(zeroFile, nil) {
+		t.Fatal("expected 0-byte file to not be ready")
+	}
+
+	// 3. Normal file modified recently (<1s) should wait for settling
+	readyFile := filepath.Join(tempDir, "ready.jpg")
+	_ = os.WriteFile(readyFile, []byte("valid content"), 0o644)
+	// Immediately after writing, modTime is Now(), so readiness check defers it
+	if isFileReadyForUpload(readyFile, nil) {
+		t.Fatal("expected brand new file with recent modtime to defer upload for settling")
+	}
+
+	// 4. File with older modTime should be ready
+	pastTime := time.Now().Add(-5 * time.Second)
+	_ = os.Chtimes(readyFile, pastTime, pastTime)
+	info, _ := os.Stat(readyFile)
+	if !isFileReadyForUpload(readyFile, info) {
+		t.Fatal("expected settled file to be ready for upload")
+	}
+}
+
+func TestAutoBackupFailureBackoff(t *testing.T) {
+	tempDir := t.TempDir()
+	testFile := filepath.Join(tempDir, "broken.jpg")
+	if err := os.WriteFile(testFile, []byte("broken content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(testFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	abManager := NewAutoBackupManager(nil, slog.Default(), nil)
+
+	// Initially not failing
+	if abManager.shouldSkipFailure(testFile, fi.Size(), fi.ModTime().Unix()) {
+		t.Fatal("expected new file to not be skipped")
+	}
+
+	// Record a failure
+	abManager.recordFailure(testFile, errors.New("simulated upload error"))
+	abs, _ := filepath.Abs(testFile)
+	abManager.mu.Lock()
+	rec := abManager.failures[abs]
+	abManager.mu.Unlock()
+
+	if rec == nil || rec.consecutiveFailures != 1 {
+		t.Fatalf("expected 1 failure recorded, got %v", rec)
+	}
+
+	// Now shouldSkipFailure should be true (in backoff)
+	if !abManager.shouldSkipFailure(testFile, fi.Size(), fi.ModTime().Unix()) {
+		t.Fatal("expected failed file to be skipped during backoff window")
+	}
+
+	// If file was edited (different modTime or size), backoff should reset
+	if abManager.shouldSkipFailure(testFile, fi.Size()+50, fi.ModTime().Unix()) {
+		t.Fatal("expected modified file size to reset failure backoff")
+	}
+
+	// Clear failure
+	abManager.clearFailure(testFile)
+	if abManager.shouldSkipFailure(testFile, fi.Size(), fi.ModTime().Unix()) {
+		t.Fatal("expected cleared failure to not be skipped")
+	}
+}
+
