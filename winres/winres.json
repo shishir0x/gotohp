@@ -9,14 +9,15 @@
   },
   "RT_MANIFEST": {
     "#1": {
-      "0409": "../build/windows/wails.exe.manifest"
+      "0000": "../build/windows/wails.exe.manifest"
     }
   },
   "RT_VERSION": {
     "#1": {
       "0000": {
         "fixed": {
-          "file_version": "0.11.1"
+          "file_version": "0.11.1.0",
+          "product_version": "0.11.1.0"
         },
         "info": {
           "0409": {
