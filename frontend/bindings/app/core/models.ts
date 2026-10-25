@@ -30,6 +30,35 @@ export class AccountSummary {
     }
 }
 
+export class AutoBackupConfig {
+    "enabled": boolean;
+    "folders": string[];
+    "intervalMinutes": number;
+
+    /** Creates a new AutoBackupConfig instance. */
+    constructor($$source: Partial<AutoBackupConfig> = {}) {
+        if (!("enabled" in $$source)) {
+            this["enabled"] = false;
+        }
+        if (!("folders" in $$source)) {
+            this["folders"] = [];
+        }
+        if (!("intervalMinutes" in $$source)) {
+            this["intervalMinutes"] = 15;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new AutoBackupConfig instance from a string or object.
+     */
+    static createFrom($$source: any = {}): AutoBackupConfig {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new AutoBackupConfig($$parsedSource as Partial<AutoBackupConfig>);
+    }
+}
+
 export class AccountsState {
     "accounts": AccountSummary[];
     "selected": string;

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -47,10 +48,18 @@ type Preferences struct {
 	AlbumAutoMode bool   `json:"albumAutoMode" koanf:"-"`
 }
 
+// AutoBackupConfig holds the persistent auto-backup settings.
+type AutoBackupConfig struct {
+	Enabled         bool     `json:"enabled" koanf:"enabled"`
+	Folders         []string `json:"folders" koanf:"folders"`
+	IntervalMinutes int      `json:"intervalMinutes" koanf:"interval_minutes"`
+}
+
 // Config is the on-disk layout of gotohp.config.
 type Config struct {
-	Account     AccountConfig `json:"account" koanf:"account"`
-	Preferences Preferences   `json:"preferences" koanf:"preferences"`
+	Account     AccountConfig    `json:"account" koanf:"account"`
+	Preferences Preferences      `json:"preferences" koanf:"preferences"`
+	AutoBackup  AutoBackupConfig `json:"autoBackup" koanf:"auto_backup"`
 }
 
 // legacyConfig is the pre-sectioned flat layout, kept only for migration.
@@ -90,6 +99,10 @@ func (l legacyConfig) toConfig() Config {
 			SetDateFromFilename:           l.SetDateFromFilename,
 			ExcludePattern:                l.ExcludePattern,
 		},
+		AutoBackup: AutoBackupConfig{
+			Folders:         []string{},
+			IntervalMinutes: 15,
+		},
 	}
 }
 
@@ -113,7 +126,14 @@ var (
 		SkipIncompleteLivePhotos: true,
 		UploadThreads:            3,
 	}
-	DefaultConfig = Config{Preferences: DefaultPreferences}
+	DefaultAutoBackup = AutoBackupConfig{
+		Folders:         []string{},
+		IntervalMinutes: 15,
+	}
+	DefaultConfig = Config{
+		Preferences: DefaultPreferences,
+		AutoBackup:  DefaultAutoBackup,
+	}
 )
 
 // ParseAuthString parses an auth string and returns url.Values (exported for CLI use)
@@ -251,6 +271,122 @@ func (g *ConfigManager) GetExcludePattern() string {
 	configMu.RLock()
 	defer configMu.RUnlock()
 	return AppConfig.Preferences.ExcludePattern
+}
+
+// GetAutoBackup returns the current auto-backup configuration.
+func (g *ConfigManager) GetAutoBackup() AutoBackupConfig {
+	ensureConfigLoaded()
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return AppConfig.AutoBackup
+}
+
+// SetAutoBackupEnabled enables or disables auto-backup and persists the setting.
+func (g *ConfigManager) SetAutoBackupEnabled(enabled bool) {
+	updateAppConfig(func(config *Config) {
+		config.AutoBackup.Enabled = enabled
+	})
+}
+
+// SetAutoBackupInterval updates the scanning interval in minutes and persists the setting.
+func (g *ConfigManager) SetAutoBackupInterval(minutes int) {
+	if minutes < 1 {
+		minutes = 15
+	}
+	updateAppConfig(func(config *Config) {
+		config.AutoBackup.IntervalMinutes = minutes
+	})
+}
+
+func areSameFolderPath(p1, p2 string) bool {
+	c1 := filepath.Clean(p1)
+	c2 := filepath.Clean(p2)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(c1, c2)
+	}
+	return c1 == c2
+}
+
+func isSubFolderPath(parent, child string) bool {
+	p := filepath.Clean(parent)
+	c := filepath.Clean(child)
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(p)
+		c = strings.ToLower(c)
+	}
+	rel, err := filepath.Rel(p, c)
+	if err != nil {
+		return false
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return false
+	}
+	return true
+}
+
+// AddAutoBackupFolder adds path to the backup folders list if it is not already
+// present or covered by an existing parent folder. Returns the updated folder list.
+func (g *ConfigManager) AddAutoBackupFolder(path string) ([]string, error) {
+	ensureConfigLoaded()
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		absPath = filepath.Clean(path)
+	}
+	if _, err := os.Stat(absPath); err != nil {
+		return nil, fmt.Errorf("folder does not exist or is inaccessible: %w", err)
+	}
+
+	configMu.Lock()
+	defer configMu.Unlock()
+
+	var updated []string
+	for _, existing := range AppConfig.AutoBackup.Folders {
+		if areSameFolderPath(existing, absPath) {
+			result := make([]string, len(AppConfig.AutoBackup.Folders))
+			copy(result, AppConfig.AutoBackup.Folders)
+			return result, nil // already in list
+		}
+		// If the new path is a subfolder of an existing monitored folder, do not add duplicate child
+		if isSubFolderPath(existing, absPath) {
+			result := make([]string, len(AppConfig.AutoBackup.Folders))
+			copy(result, AppConfig.AutoBackup.Folders)
+			return result, nil
+		}
+		// If the new path is a parent of an existing monitored folder, replace child with parent
+		if !isSubFolderPath(absPath, existing) {
+			updated = append(updated, existing)
+		}
+	}
+	updated = append(updated, absPath)
+	AppConfig.AutoBackup.Folders = updated
+	_ = saveAppConfigLocked()
+	result := make([]string, len(AppConfig.AutoBackup.Folders))
+	copy(result, AppConfig.AutoBackup.Folders)
+	return result, nil
+}
+
+// RemoveAutoBackupFolder removes path from the backup folders list.
+// Returns the updated folder list.
+func (g *ConfigManager) RemoveAutoBackupFolder(path string) []string {
+	ensureConfigLoaded()
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		absPath = filepath.Clean(path)
+	}
+	updateAppConfig(func(config *Config) {
+		var updated []string
+		for _, f := range config.AutoBackup.Folders {
+			if !areSameFolderPath(f, absPath) && !areSameFolderPath(f, path) {
+				updated = append(updated, f)
+			}
+		}
+		config.AutoBackup.Folders = updated
+	})
+	configMu.RLock()
+	defer configMu.RUnlock()
+	result := make([]string, len(AppConfig.AutoBackup.Folders))
+	copy(result, AppConfig.AutoBackup.Folders)
+	return result
 }
 
 func (g *ConfigManager) AddCredentials(newAuthString string) error {
@@ -659,6 +795,15 @@ func currentConfig() Config {
 	return AppConfig
 }
 
+// CurrentAutoBackupConfig returns a snapshot of the auto-backup config.
+// Exported so main.go can read it without a ConfigManager value receiver.
+func CurrentAutoBackupConfig() AutoBackupConfig {
+	ensureConfigLoaded()
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return AppConfig.AutoBackup
+}
+
 func (g *ConfigManager) GetSettings() Preferences {
 	ensureConfigLoaded()
 	configMu.RLock()
@@ -819,6 +964,14 @@ func loadAppConfig() Config {
 
 	if c.Preferences.UploadThreads < 1 {
 		c.Preferences.UploadThreads = DefaultPreferences.UploadThreads
+	}
+
+	if c.AutoBackup.Folders == nil {
+		c.AutoBackup.Folders = []string{}
+	}
+
+	if c.AutoBackup.IntervalMinutes < 1 {
+		c.AutoBackup.IntervalMinutes = 15
 	}
 
 	return c

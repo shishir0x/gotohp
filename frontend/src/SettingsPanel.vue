@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { nextTick, ref, onMounted, watch } from 'vue'
 import { ConfigManager } from '../bindings/app/core'
+import { Dialogs, Events } from "@wailsio/runtime"
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import { Button } from '@/components/ui/button'
 import {
     Tooltip,
     TooltipContent,
     TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { Info } from '@lucide/vue'
+import { Info, FolderPlus, Trash2, RefreshCw } from '@lucide/vue'
 
 import {
     NumberField,
@@ -52,6 +54,14 @@ const settings = ref<Settings>({
 })
 const isHydrating = ref(true)
 
+// ── Auto Backup ──────────────────────────────────────────────────────────────
+const autoBackupEnabled = ref(false)
+const autoBackupFolders = ref<string[]>([])
+const autoBackupInterval = ref(15)
+const autoBackupHydrating = ref(true)
+const addFolderError = ref('')
+const isScanningNow = ref(false)
+
 const toggleSetting = (setting: BooleanSetting, enabled = true) => {
     if (!enabled) return
     settings.value[setting] = !settings.value[setting]
@@ -78,7 +88,68 @@ onMounted(async () => {
         await nextTick()
         isHydrating.value = false
     }
+
+    // Load auto-backup config
+    try {
+        const abCfg = await ConfigManager.GetAutoBackup()
+        autoBackupEnabled.value = abCfg.enabled || false
+        autoBackupFolders.value = [...(abCfg.folders || [])]
+        autoBackupInterval.value = abCfg.intervalMinutes || 15
+    } finally {
+        await nextTick()
+        autoBackupHydrating.value = false
+    }
 })
+
+async function addFolder() {
+    addFolderError.value = ''
+    try {
+        const chosen = await Dialogs.OpenFile({
+            CanChooseDirectories: true,
+            CanChooseFiles: false,
+            Title: 'Select backup folder'
+        })
+        if (!chosen) return
+        const folderPath = Array.isArray(chosen) ? chosen[0] : chosen
+        if (!folderPath || typeof folderPath !== 'string') return
+
+        const updated = await ConfigManager.AddAutoBackupFolder(folderPath)
+        autoBackupFolders.value = [...(updated || [])]
+        if (autoBackupEnabled.value) {
+            Events.Emit('restartAutoBackup', null)
+        }
+    } catch (e: any) {
+        addFolderError.value = e?.message || String(e)
+    }
+}
+
+async function removeFolder(path: string) {
+    try {
+        const updated = await ConfigManager.RemoveAutoBackupFolder(path)
+        autoBackupFolders.value = [...(updated || [])]
+        if (autoBackupEnabled.value) {
+            Events.Emit('restartAutoBackup', null)
+        }
+    } catch (e: any) {
+        console.error('Failed to remove backup folder:', e)
+    }
+}
+
+async function updateInterval(minutes: number) {
+    autoBackupInterval.value = minutes
+    await ConfigManager.SetAutoBackupInterval(minutes)
+    if (autoBackupEnabled.value) {
+        Events.Emit('restartAutoBackup', null)
+    }
+}
+
+function triggerScanNow() {
+    isScanningNow.value = true
+    Events.Emit('triggerAutoBackupScan', null)
+    setTimeout(() => {
+        isScanningNow.value = false
+    }, 2000)
+}
 
 // Watch for changes to proxy value and update backend
 watch(() => settings.value.proxy, async (newValue) => {
@@ -149,10 +220,15 @@ watch(() => settings.value.uploadThreads, async (newValue) => {
         await ConfigManager.SetUploadThreads(newValue)
     }
 })
+
+watch(autoBackupEnabled, async (newValue) => {
+    if (autoBackupHydrating.value) return
+    Events.Emit('setAutoBackupEnabled', newValue)
+})
 </script>
 
 <template>
-  <div class="flex flex-col gap-2.5 m-4">
+  <div class="flex flex-col gap-2.5 p-4 max-h-[500px] overflow-y-auto">
     <NumberField
       v-model="settings.uploadThreads"
       class="flex items-center justify-between"
@@ -364,6 +440,111 @@ watch(() => settings.value.uploadThreads, async (newValue) => {
         type="text"
         placeholder="Proxy URL (optional)"
       />
+    </div>
+
+    <!-- ── Auto Backup section ─────────────────────────────────────────── -->
+    <div class="mt-3 border-t pt-3 flex flex-col gap-2.5">
+      <div class="flex items-center justify-between">
+        <div>
+          <Label for="auto-backup-toggle" class="cursor-pointer font-semibold">Auto Backup</Label>
+          <p class="text-xs text-muted-foreground">Automatically scan and backup photos from folders</p>
+        </div>
+        <Switch
+          id="auto-backup-toggle"
+          v-model="autoBackupEnabled"
+        />
+      </div>
+
+      <!-- Interval Selector -->
+      <div v-if="autoBackupEnabled" class="flex items-center justify-between">
+        <Label class="text-sm">Scan Interval</Label>
+        <div class="flex items-center gap-1">
+          <Button
+            type="button"
+            size="sm"
+            :variant="autoBackupInterval === 5 ? 'default' : 'outline'"
+            class="text-xs px-2 py-0.5 h-7 cursor-pointer"
+            @click="updateInterval(5)"
+          >
+            5m
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            :variant="autoBackupInterval === 15 ? 'default' : 'outline'"
+            class="text-xs px-2 py-0.5 h-7 cursor-pointer"
+            @click="updateInterval(15)"
+          >
+            15m
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            :variant="autoBackupInterval === 30 ? 'default' : 'outline'"
+            class="text-xs px-2 py-0.5 h-7 cursor-pointer"
+            @click="updateInterval(30)"
+          >
+            30m
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            :variant="autoBackupInterval === 60 ? 'default' : 'outline'"
+            class="text-xs px-2 py-0.5 h-7 cursor-pointer"
+            @click="updateInterval(60)"
+          >
+            1h
+          </Button>
+        </div>
+      </div>
+
+      <!-- Scan Now Button -->
+      <div v-if="autoBackupEnabled && autoBackupFolders.length" class="flex justify-end">
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          class="gap-1 text-xs h-7 cursor-pointer"
+          :disabled="isScanningNow"
+          @click="triggerScanNow"
+        >
+          <RefreshCw class="size-3" :class="{ 'animate-spin': isScanningNow }" />
+          {{ isScanningNow ? 'Scanning...' : 'Scan Now' }}
+        </Button>
+      </div>
+
+      <!-- Folder list -->
+      <div v-if="autoBackupFolders.length" class="flex flex-col gap-1 max-h-36 overflow-y-auto">
+        <div
+          v-for="folder in autoBackupFolders"
+          :key="folder"
+          class="flex items-center justify-between gap-2 rounded-md bg-muted px-2 py-1 text-sm"
+        >
+          <span class="truncate text-xs text-muted-foreground" :title="folder">{{ folder }}</span>
+          <button
+            type="button"
+            class="shrink-0 text-destructive hover:text-destructive/80 cursor-pointer"
+            aria-label="Remove folder"
+            @click="removeFolder(folder)"
+          >
+            <Trash2 class="size-3.5" />
+          </button>
+        </div>
+      </div>
+      <p v-else class="text-xs text-muted-foreground">No backup folders configured yet.</p>
+
+      <!-- Add folder button -->
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        class="w-full gap-1.5 cursor-pointer text-xs"
+        @click="addFolder"
+      >
+        <FolderPlus class="size-4" />
+        Add Backup Folder
+      </Button>
+      <p v-if="addFolderError" class="mt-1 text-xs text-destructive">{{ addFolderError }}</p>
     </div>
   </div>
 </template>

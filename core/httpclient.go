@@ -7,9 +7,22 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// PermanentUploadError wraps an HTTP error that must not be retried because
+// re-sending the same request cannot succeed (e.g. 400 Bad Request, 403
+// Forbidden, 404 Not Found, 410 Gone).
+type PermanentUploadError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *PermanentUploadError) Error() string {
+	return fmt.Sprintf("permanent upload failure (HTTP %d): %s", e.StatusCode, e.Body)
+}
 
 func NewHTTPClientWithProxy(proxyURLStr string) (*http.Client, error) {
 	// Create the base transport with default values
@@ -66,6 +79,50 @@ func ShouldRetry(resp *http.Response, err error) bool {
 	}
 	// Retry on 5xx server errors and 429 (rate limit)
 	return resp.StatusCode >= 500 || resp.StatusCode == 429
+}
+
+// ShouldRetryUpload returns (retryable, retryAfter) for an upload PUT response.
+// 4xx errors other than 408 (Request Timeout) and 429 (Rate Limit) are
+// permanent: the same session token cannot be recovered by retrying.
+func ShouldRetryUpload(statusCode int) (retryable bool, retryAfter time.Duration) {
+	switch {
+	case statusCode == 429:
+		return true, 0 // caller parses Retry-After
+	case statusCode == 408:
+		return true, 0
+	case statusCode >= 500:
+		return true, 0
+	default:
+		// 400, 401, 403, 404, 410, etc. — permanent
+		return false, 0
+	}
+}
+
+// ParseRetryAfter reads the Retry-After header value and returns the delay to
+// wait. Returns 0 if the header is absent or unparseable.
+func ParseRetryAfter(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	// Integer seconds form
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+		return 0
+	}
+	// HTTP-date form
+	for _, layout := range []string{time.RFC1123, time.RFC850, time.ANSIC} {
+		if t, err := time.Parse(layout, v); err == nil {
+			d := time.Until(t)
+			if d > 0 {
+				return d
+			}
+			return 0
+		}
+	}
+	return 0
 }
 
 // CalculateBackoff returns the delay for a given attempt (exponential backoff with jitter)

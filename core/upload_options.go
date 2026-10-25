@@ -25,6 +25,13 @@ type UploadOptions struct {
 	// AlbumAutoMode is set, which creates one album per source directory.
 	AlbumName     string
 	AlbumAutoMode bool
+
+	// OnFileUploaded is an optional callback invoked when a file is successfully
+	// uploaded or confirmed already present in the library.
+	OnFileUploaded func(path string, size int64, modTime int64)
+
+	// OnFileFailed is an optional callback invoked when a file fails to upload.
+	OnFileFailed func(path string, err error)
 }
 
 // UploadOptions derives run options from GUI preferences.

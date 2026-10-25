@@ -20,6 +20,9 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+//go:embed build/appicon.png
+var appIcon []byte
+
 var title = "gotohp v" + getAppVersion()
 
 func main() {
@@ -38,10 +41,12 @@ func main() {
 func runGUI() {
 	normalizeFrontendDevServerURL()
 
+	var mainWindow *application.WebviewWindow
 	configManager := &core.ConfigManager{}
 	wailsApp := application.New(application.Options{
 		Name:        "com.xob0t.gotohp",
 		Description: "Google Photos unofficial client",
+		Icon:        appIcon,
 		Services: []application.Service{
 			application.NewService(configManager),
 		},
@@ -49,7 +54,22 @@ func runGUI() {
 			Handler: application.BundledAssetFileServer(assets),
 		},
 		Mac: application.MacOptions{
-			ApplicationShouldTerminateAfterLastWindowClosed: true,
+			ApplicationShouldTerminateAfterLastWindowClosed: false,
+		},
+		Windows: application.WindowsOptions{
+			DisableQuitOnLastWindowClosed: true,
+		},
+		Linux: application.LinuxOptions{
+			DisableQuitOnLastWindowClosed: true,
+		},
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: "com.xob0t.gotohp",
+			OnSecondInstanceLaunch: func(data application.SecondInstanceData) {
+				if mainWindow != nil {
+					mainWindow.Show()
+					mainWindow.Focus()
+				}
+			},
 		},
 	})
 
@@ -69,8 +89,29 @@ func runGUI() {
 		},
 		URL: "/",
 	})
+	mainWindow = window
 
 	uploadManager := core.NewUploadManager(gui.NewWailsReporter(wailsApp), wailsApp.Logger)
+
+	// Create auto-backup manager; notify the frontend whenever state changes.
+	autoBackupManager := core.NewAutoBackupManager(uploadManager, wailsApp.Logger, func(enabled bool, folders []string) {
+		if folders == nil {
+			folders = []string{}
+		}
+		cfg := core.CurrentAutoBackupConfig()
+		wailsApp.Event.Emit("autoBackupStatus", gui.AutoBackupStatus{
+			Enabled:         enabled,
+			Folders:         folders,
+			IntervalMinutes: cfg.IntervalMinutes,
+		})
+	})
+
+	// Start the watcher/scheduler now if auto-backup was already enabled at launch.
+	if cfg := core.CurrentAutoBackupConfig(); cfg.Enabled && len(cfg.Folders) > 0 {
+		if err := autoBackupManager.Start(); err != nil {
+			wailsApp.Logger.Error("auto-backup: failed to start at launch", "err", err)
+		}
+	}
 
 	// Listen for upload cancel event
 	wailsApp.Event.On("uploadCancel", func(e *application.CustomEvent) {
@@ -106,7 +147,71 @@ func runGUI() {
 		}
 	})
 
+	// Listen for auto-backup toggle from frontend
+	wailsApp.Event.On("setAutoBackupEnabled", func(e *application.CustomEvent) {
+		enabled, _ := e.Data.(bool)
+		configManager.SetAutoBackupEnabled(enabled)
+		if enabled {
+			if err := autoBackupManager.Restart(); err != nil {
+				wailsApp.Logger.Error("auto-backup: failed to restart", "err", err)
+			}
+		} else {
+			autoBackupManager.Stop()
+		}
+	})
+
+	// Listen for folder-list or interval changes from frontend
+	wailsApp.Event.On("restartAutoBackup", func(e *application.CustomEvent) {
+		if err := autoBackupManager.Restart(); err != nil {
+			wailsApp.Logger.Error("auto-backup: failed to restart after config change", "err", err)
+		}
+	})
+
+	// Listen for manual scan trigger from frontend
+	wailsApp.Event.On("triggerAutoBackupScan", func(e *application.CustomEvent) {
+		autoBackupManager.TriggerScan()
+	})
+
+	// Set up system tray for background running
+	systemTray := wailsApp.SystemTray.New()
+	if len(appIcon) > 0 {
+		systemTray.SetIcon(appIcon)
+	}
+	systemTray.SetTooltip("gotohp - Google Photos Backup")
+
+	trayMenu := application.NewMenu()
+	trayMenu.Add("Open gotohp").OnClick(func(ctx *application.Context) {
+		window.Show()
+		window.Focus()
+	})
+	trayMenu.Add("Scan Now").OnClick(func(ctx *application.Context) {
+		autoBackupManager.TriggerScan()
+	})
+	trayMenu.AddSeparator()
+	var isQuitting bool
+	trayMenu.Add("Quit").OnClick(func(ctx *application.Context) {
+		isQuitting = true
+		autoBackupManager.Stop()
+		wailsApp.Quit()
+	})
+	systemTray.SetMenu(trayMenu)
+
+	systemTray.OnClick(func() {
+		window.Show()
+		window.Focus()
+	})
+
+	// Intercept window close so it minimizes to system tray instead of exiting
+	window.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
+		if !isQuitting {
+			event.Cancel()
+			window.Hide()
+		}
+	})
+
 	err := wailsApp.Run()
+	autoBackupManager.Stop() // clean shutdown
+	_ = core.CloseAppDatabase()
 	if err != nil {
 		log.Fatal(err)
 	}
