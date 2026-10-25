@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![gotohp demo](readme_assets/app_demo.webp)
+
 
 **Cross-platform desktop and command-line client for Google Photos with batch uploads, album organization, Apple Live Photo pairing, and unlimited storage options.**
 

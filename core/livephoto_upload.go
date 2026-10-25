@@ -11,7 +11,7 @@ import (
 type livePhotoUploadAPI interface {
 	FindRemoteMediaByHash(hash []byte) (string, error)
 	GetUploadToken(sha1Hash string, fileSize int64) (string, error)
-	UploadFileWithProgress(ctx context.Context, filePath string, uploadToken string, onProgress UploadProgressCallback) (ScottyFinalizeToken, error)
+	UploadFileWithProgress(ctx context.Context, filePath string, sha1HashB64 string, fileSize int64, onProgress UploadProgressCallback) (ScottyFinalizeToken, error)
 	CommitLivePhoto(input LivePhotoCreateRequest) (string, error)
 	ReconcileLivePhoto(input LivePhotoReconcileRequest) (string, error)
 }
@@ -252,13 +252,15 @@ func uploadLivePhotoComponent(
 	displayName string,
 	reporter UploadReporter,
 ) (ScottyFinalizeToken, error) {
-	uploadSession, err := api.GetUploadToken(base64.StdEncoding.EncodeToString(hash), size)
-	if err != nil {
-		return ScottyFinalizeToken{}, err
-	}
+	sha1B64 := base64.StdEncoding.EncodeToString(hash)
 	progress := func(bytesUploaded, _ int64, attempt int) {
-		message := "Uploading Live Photo pair..."
-		if attempt > 1 {
+		var message string
+		switch {
+		case attempt == 1:
+			message = "Uploading Live Photo pair..."
+		case bytesUploaded == 0:
+			message = fmt.Sprintf("Retrying Live Photo component (new session, attempt %d)...", attempt)
+		default:
 			message = fmt.Sprintf("Retrying Live Photo component (attempt %d)...", attempt)
 		}
 		reporter.ThreadStatus(ThreadStatus{
@@ -272,7 +274,8 @@ func uploadLivePhotoComponent(
 			Attempt:       attempt,
 		})
 	}
-	return api.UploadFileWithProgress(ctx, componentPath, uploadSession, progress)
+	// UploadFileWithProgress acquires its own token per attempt; no pre-call needed.
+	return api.UploadFileWithProgress(ctx, componentPath, sha1B64, size, progress)
 }
 
 func removeLivePhotoFiles(pair LivePhotoPair) error {

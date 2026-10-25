@@ -628,15 +628,15 @@ func uploadSingleFile(ctx context.Context, api *Api, filePath string, opts Uploa
 		BytesTotal:    fileSize,
 	})
 
-	token, err := api.GetUploadToken(sha1_hash_b64, fileSize)
-	if err != nil {
-		return "", fmt.Errorf("error uploading file: %w", err)
-	}
-
 	// Create progress callback for upload
 	progressCallback := func(bytesUploaded, bytesTotal int64, attempt int) {
-		message := "Uploading..."
-		if attempt > 1 {
+		var message string
+		switch {
+		case attempt == 1:
+			message = "Uploading..."
+		case bytesUploaded == 0:
+			message = fmt.Sprintf("Retrying (new session, attempt %d)...", attempt)
+		default:
 			message = fmt.Sprintf("Retrying... (attempt %d)", attempt)
 		}
 		reporter.ThreadStatus(ThreadStatus{
@@ -651,8 +651,15 @@ func uploadSingleFile(ctx context.Context, api *Api, filePath string, opts Uploa
 		})
 	}
 
-	finalizeToken, err := api.UploadFileWithProgress(ctx, filePath, token, progressCallback)
+	// UploadFileWithProgress acquires a fresh Scotty session token before each
+	// attempt, so stale sessions from failed attempts never block retries.
+	finalizeToken, err := api.UploadFileWithProgress(ctx, filePath, sha1_hash_b64, fileSize, progressCallback)
 	if err != nil {
+		var permanentErr *PermanentUploadError
+		if errors.As(err, &permanentErr) {
+			// Surface a user-readable reason without exposing server internals.
+			return "", fmt.Errorf("upload rejected by server (HTTP %d) — file may be unsupported or account may lack permission", permanentErr.StatusCode)
+		}
 		return "", fmt.Errorf("error uploading file: %w", err)
 	}
 	commitToken, err := finalizeToken.legacyCommitToken()
