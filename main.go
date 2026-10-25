@@ -46,6 +46,7 @@ func runGUI() {
 	wailsApp := application.New(application.Options{
 		Name:        "com.xob0t.gotohp",
 		Description: "Google Photos unofficial client",
+		Icon:        appIcon,
 		Services: []application.Service{
 			application.NewService(configManager),
 		},
